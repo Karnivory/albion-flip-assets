@@ -1,0 +1,100 @@
+name: Build Albion Icon Pack
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-icons:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Preparar ambiente
+        run: |
+          mkdir -p icons
+          mkdir -p build
+
+      - name: Baixar lista atual de itens
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/formatted/items.txt \
+            -o build/items.txt
+
+          sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*([^[:space:]]+).*/\1/' \
+            build/items.txt \
+            | grep -v '^[[:space:]]*$' \
+            | sort -u \
+            > build/item_ids.txt
+
+          echo "Itens encontrados:"
+          wc -l build/item_ids.txt
+
+      - name: Baixar ícones
+        shell: bash
+        run: |
+          download_icon() {
+            id="$1"
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --retry 3 \
+              --retry-delay 2 \
+              --connect-timeout 20 \
+              --max-time 60 \
+              "https://render.albiononline.com/v1/item/${id}.png?quality=1&size=64" \
+              --output "icons/${id}.png"
+            then
+              echo "OK $id"
+            else
+              echo "$id" >> build/failed.txt
+              rm -f "icons/${id}.png"
+            fi
+          }
+
+          export -f download_icon
+
+          touch build/failed.txt
+
+          cat build/item_ids.txt \
+            | xargs -n 1 -P 4 bash -c 'download_icon "$0"'
+
+      - name: Criar informações do pacote
+        run: |
+          ICON_COUNT=$(find icons -type f -name '*.png' | wc -l)
+          FAILED_COUNT=$(wc -l < build/failed.txt)
+
+          {
+            echo "Albion Flip Mobile - Icon Pack"
+            echo "Version: v1"
+            echo "Resolution: 64x64"
+            echo "Icons: ${ICON_COUNT}"
+            echo "Failed: ${FAILED_COUNT}"
+            echo "Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > build/manifest.txt
+
+          cp build/item_ids.txt build/items.txt
+
+          cat build/manifest.txt
+
+      - name: Compactar pacote
+        run: |
+          zip -q -r albion-icons-v1.zip icons build/items.txt build/manifest.txt build/failed.txt
+
+          ls -lh albion-icons-v1.zip
+
+      - name: Criar Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create icons-v1 \
+            albion-icons-v1.zip \
+            build/manifest.txt \
+            build/failed.txt \
+            --title "Albion Icons v1" \
+            --notes "Pacote inicial de ícones para o Albion Flip Mobile. Ícones 64x64 gerados a partir dos IDs atuais do Albion."
