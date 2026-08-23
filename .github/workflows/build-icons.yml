@@ -5,33 +5,46 @@ on: workflow_dispatch
 permissions:
   contents: write
 
+concurrency:
+  group: albion-icon-pack
+  cancel-in-progress: false
+
 jobs:
-  build-icons:
+  download-icons:
+    name: Download shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
 
     steps:
-      - name: Preparar ambiente
+      - name: Preparar lista deste lote
+        shell: bash
         run: |
-          mkdir -p icons
-          mkdir -p build
+          mkdir -p icons build
 
-      - name: Baixar lista atual de itens
-        run: |
           curl -fsSL \
             https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/formatted/items.txt \
-            -o build/items.txt
+            -o build/items-source.txt
 
           sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*([^[:space:]]+).*/\1/' \
-            build/items.txt \
+            build/items-source.txt \
             | grep -v '^[[:space:]]*$' \
             | sort -u \
-            > build/item_ids.txt
+            > build/item_ids_all.txt
 
-          echo "Itens encontrados:"
-          wc -l build/item_ids.txt
+          awk -v shard="${{ matrix.shard }}" \
+              '((NR - 1) % 4) == shard' \
+              build/item_ids_all.txt \
+              > build/item_ids_shard.txt
 
-      - name: Baixar ícones
+          echo "Lote ${{ matrix.shard }}:"
+          wc -l build/item_ids_shard.txt
+
+      - name: Baixar ícones deste lote
         shell: bash
         run: |
           download_icon() {
@@ -43,57 +56,128 @@ jobs:
               --show-error \
               --location \
               --retry 3 \
-              --retry-delay 2 \
-              --connect-timeout 20 \
-              --max-time 60 \
+              --retry-delay 1 \
+              --connect-timeout 10 \
+              --max-time 30 \
               "https://render.albiononline.com/v1/item/${id}.png?quality=1&size=64" \
               --output "icons/${id}.png"
             then
               echo "OK $id"
             else
-              echo "$id" >> build/failed.txt
+              echo "$id" >> "build/failed-${{ matrix.shard }}.txt"
               rm -f "icons/${id}.png"
             fi
           }
 
           export -f download_icon
 
-          touch build/failed.txt
+          : > "build/failed-${{ matrix.shard }}.txt"
 
-          cat build/item_ids.txt \
-            | xargs -n 1 -P 4 bash -c 'download_icon "$0"'
+          xargs -r -n 1 -P 4 bash -c 'download_icon "$1"' _ \
+            < build/item_ids_shard.txt
 
-      - name: Criar informações do pacote
+          echo "Ícones baixados neste lote:"
+          find icons -type f -name '*.png' | wc -l
+
+          echo "Falhas neste lote:"
+          wc -l "build/failed-${{ matrix.shard }}.txt"
+
+      - name: Guardar lote temporariamente
+        uses: actions/upload-artifact@v4
+        with:
+          name: icon-shard-${{ matrix.shard }}
+          path: |
+            icons/
+            build/failed-${{ matrix.shard }}.txt
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 1
+
+  package-and-release:
+    name: Package and release
+    needs: download-icons
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Reunir todos os lotes
+        uses: actions/download-artifact@v4
+        with:
+          pattern: icon-shard-*
+          path: package
+          merge-multiple: true
+
+      - name: Recriar lista completa e manifesto
+        shell: bash
         run: |
-          ICON_COUNT=$(find icons -type f -name '*.png' | wc -l)
-          FAILED_COUNT=$(wc -l < build/failed.txt)
+          mkdir -p build
+
+          curl -fsSL \
+            https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/formatted/items.txt \
+            -o build/items-source.txt
+
+          sed -E 's/^[[:space:]]*[0-9]+:[[:space:]]*([^[:space:]]+).*/\1/' \
+            build/items-source.txt \
+            | grep -v '^[[:space:]]*$' \
+            | sort -u \
+            > build/items.txt
+
+          cat package/build/failed-*.txt 2>/dev/null \
+            | sort -u \
+            > build/failed.txt || true
+
+          ICON_COUNT=$(find package/icons -type f -name '*.png' | wc -l | tr -d ' ')
+          EXPECTED_COUNT=$(wc -l < build/items.txt | tr -d ' ')
+          FAILED_COUNT=$(wc -l < build/failed.txt | tr -d ' ')
 
           {
             echo "Albion Flip Mobile - Icon Pack"
             echo "Version: v1"
             echo "Resolution: 64x64"
+            echo "Expected IDs: ${EXPECTED_COUNT}"
             echo "Icons: ${ICON_COUNT}"
             echo "Failed: ${FAILED_COUNT}"
             echo "Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           } > build/manifest.txt
 
-          cp build/item_ids.txt build/items.txt
-
           cat build/manifest.txt
 
       - name: Compactar pacote
+        shell: bash
         run: |
-          zip -q -r albion-icons-v1.zip icons build/items.txt build/manifest.txt build/failed.txt
+          cd package
+          zip -q -r ../albion-icons-v1.zip icons
+          cd ..
+
+          zip -q \
+            albion-icons-v1.zip \
+            build/items.txt \
+            build/manifest.txt \
+            build/failed.txt
 
           ls -lh albion-icons-v1.zip
 
-      - name: Criar Release
+      - name: Criar ou atualizar Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
         run: |
-          gh release create icons-v1 \
-            albion-icons-v1.zip \
-            build/manifest.txt \
-            build/failed.txt \
-            --title "Albion Icons v1" \
-            --notes "Pacote inicial de ícones para o Albion Flip Mobile. Ícones 64x64 gerados a partir dos IDs atuais do Albion."
+          if gh release view icons-v1 >/dev/null 2>&1; then
+            gh release upload icons-v1 \
+              albion-icons-v1.zip \
+              build/manifest.txt \
+              build/failed.txt \
+              --clobber
+
+            gh release edit icons-v1 \
+              --title "Albion Icons v1" \
+              --notes "Pacote de ícones 64x64 para o Albion Flip Mobile."
+          else
+            gh release create icons-v1 \
+              albion-icons-v1.zip \
+              build/manifest.txt \
+              build/failed.txt \
+              --title "Albion Icons v1" \
+              --notes "Pacote de ícones 64x64 para o Albion Flip Mobile."
+          fi
